@@ -71,7 +71,7 @@ bandit_auto.py
 
 ```bash
 # 1. Clone
-git clone https://github.com/YOUR_USERNAME/bandit-auto.git
+git clone https://github.com/sente-ns/bandit-auto.git
 cd bandit-auto
 
 # 2. Install dependencies
