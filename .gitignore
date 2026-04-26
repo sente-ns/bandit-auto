@@ -216,3 +216,78 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Secrets & output ──────────────────────────────────────────────────────────
+.env
+bandit_passwords.txt
+bandit_known_hosts
+
+# ── Python bytecode ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── Distribution / packaging ──────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env.local
+.env.*.local
+
+# ── Testing & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+
+# ── Type checkers ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
+.dmypy.json
+
+# ── Linters & formatters ──────────────────────────────────────────────────────
+.ruff_cache/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS cruft ──────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+desktop.ini
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+/tmp/
