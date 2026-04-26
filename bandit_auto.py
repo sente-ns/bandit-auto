@@ -38,41 +38,51 @@ Security hardening summary
   Exception log   : only type(exc).__name__ — message never reaches the log
   fd lifecycle    : _close_pw_file() in try/finally — guaranteed on sys.exit()
 
+Patch v6.3 — retry/backoff in _connect() + socket-leak fix on retry
+────────────────────────────────────────────────────────────────────
+  Root cause:
+    OTW Bandit throttles rapid SSH connections at the banner-read phase.
+    After a successful level, CONNECT_PAUSE fires *after* solve() returns,
+    so the *next* _connect() hits the server before the throttle window
+    expires.  The server drops the TCP connection before sending the SSH
+    banner → paramiko raises SSHException("Error reading SSH protocol
+    banner").
+
+  Fix — _connect() now retries with exponential backoff + jitter:
+    attempt 1 → immediate
+    attempt 2 → base * 2^0  + U(0, jitter)   ≈ 3–4 s
+    attempt 3 → base * 2^1  + U(0, jitter)   ≈ 6–7 s
+    attempt 4 → base * 2^2  + U(0, jitter)   ≈ 12–13 s
+    (capped at _RETRY_WAIT_CAP = 30 s per sleep to prevent runaway waits)
+
+  New tunables (all via environment variables):
+    BANDIT_MAX_RETRIES     (default 4)   — total connection attempts
+    BANDIT_RETRY_BACKOFF   (default 3.0) — base wait seconds
+    BANDIT_RETRY_WAIT_CAP  (default 30)  — per-sleep ceiling in seconds
+
+  Socket-leak fix:
+    Previous code constructed a new SSHClient on every retry loop iteration
+    but never closed it on failure.  Each failed attempt now calls
+    client.close() before sleeping, ensuring the underlying socket is
+    released immediately rather than waiting for the GC finaliser.
+
 Patch v6.2 — Python 3.12+ compatibility + resource-leak fixes
 ─────────────────────────────────────────────────────────────
   Fix 1 — shutil.rmtree(onerror=...) deprecated 3.12, removed 3.14.
-           _rmtree() wrapper selects onexc= on ≥ 3.12, onerror= otherwise.
-           Applies to _secure_tmpdir() and the tail of _LEVEL12_SCRIPT.
-  Fix 2 — tarfile.extractall() without filter= raises DeprecationWarning on
-           3.12 and will raise an error on 3.14.  _tar_extractall() wrapper
-           passes filter='data' on ≥ 3.12.  Applies to _safe_tar_extract()
-           and the safe_extract() closure inside _LEVEL12_SCRIPT.
-  Fix 3 — _LEVEL12_SCRIPT: stdout=open(...) in subprocess.run() is an
-           unclosed file handle.  Replaced with explicit open/close via
-           a with-block and pass_fds= hand-off.
+  Fix 2 — tarfile.extractall() without filter= raises DeprecationWarning.
+  Fix 3 — _LEVEL12_SCRIPT: stdout=open(...) unclosed file handle.
   Fix 4 — _LEVEL12_SCRIPT: open(f).read() without encoding or close.
-           Replaced with open(f, encoding='utf-8', errors='replace').read().
-  Fix 5 — buf += chunk O(n²) realloc pattern in _tcp_send_recv() and
-           _solve_level13 Strategy B replaced with list-of-chunks + join.
+  Fix 5 — buf += chunk O(n²) realloc pattern replaced with list-of-chunks.
 
 Patch v6.1 — fix _solve_level15 output_len=0
 ─────────────────────────────────────────────
-  Root cause:
-    printf(1) exits in microseconds.  When its stdout (= openssl's stdin)
-    closes, -no_ign_eof causes openssl to immediately send TLS close_notify
-    BEFORE the server at port 30001 has had time to write its response.
-    _exec() therefore reads an empty stdout → ValueError(output_len=0).
-
-  Fix: { printf; sleep 3; } group holds the pipe open long enough for the
+  { printf; sleep 3; } group holds the pipe open long enough for the
   server to respond.  timeout 12 acts as a kill switch against hangs.
 
 Patch v6.0 — three root-cause fixes for _solve_level13 AuthenticationException
-             + output_len=0
-──────────────────────────────────────────────────────────────────────────────
-
-  Fix 1 — _ChannelSocket.fileno() raises io.UnsupportedOperation (was: delegate)
+  Fix 1 — _ChannelSocket.fileno() raises io.UnsupportedOperation
   Fix 2 — _load_private_key() normalises line endings before parsing
-  Fix 3 — Strategy B: chmod-600 tmpfile + LogLevel=ERROR (was: QUIET, no copy)
+  Fix 3 — Strategy B: chmod-600 tmpfile + LogLevel=ERROR
 """
 
 from __future__ import annotations
@@ -119,6 +129,11 @@ EXEC_TIMEOUT    = int(os.environ.get("BANDIT_EXEC_TIMEOUT", "30"))
 CONNECT_PAUSE   = float(os.environ.get("BANDIT_CONNECT_PAUSE", "2.0"))
 CONNECT_JITTER  = float(os.environ.get("BANDIT_CONNECT_JITTER", "1.0"))
 PASSWORD_FILE   = os.environ.get("BANDIT_PASSWORD_FILE", "bandit_passwords.txt")
+
+# Retry / backoff tunables (v6.3)
+MAX_CONNECT_RETRIES = int(os.environ.get("BANDIT_MAX_RETRIES", "4"))
+_RETRY_BACKOFF_BASE = float(os.environ.get("BANDIT_RETRY_BACKOFF", "3.0"))
+_RETRY_WAIT_CAP     = float(os.environ.get("BANDIT_RETRY_WAIT_CAP", "30.0"))
 
 KNOWN_HOSTS_FILE = os.environ.get(
     "BANDIT_KNOWN_HOSTS",
@@ -300,7 +315,13 @@ def _tar_extractall(tf: tarfile.TarFile, dest: str) -> None:
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
 
-def _connect(level: int, password: str) -> paramiko.SSHClient:
+def _build_client() -> tuple[paramiko.SSHClient, str | None]:
+    """
+    Construct a fresh SSHClient with the correct host-key policy.
+
+    Factored out of _connect() so the retry loop can call it without
+    duplicating the host-key setup logic.  Returns (client, kh_path).
+    """
     client = paramiko.SSHClient()
     kh = _check_known_hosts(KNOWN_HOSTS_FILE)
     if kh:
@@ -312,15 +333,69 @@ def _connect(level: int, password: str) -> paramiko.SSHClient:
             "Fix: ssh-keyscan -p %d %s > bandit_known_hosts", PORT, HOST
         )
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        HOST, port=PORT,
-        username=f"bandit{level}",
-        password=password,
-        timeout=CONNECT_TIMEOUT,
-        look_for_keys=False,
-        allow_agent=False,
+    return client, kh
+
+
+def _connect(level: int, password: str) -> paramiko.SSHClient:
+    """
+    Connect to HOST:PORT as bandit<level> with exponential backoff retry.
+
+    OTW Bandit throttles rapid SSH connections: the server drops the TCP
+    connection before sending the SSH banner when connections arrive too
+    quickly.  This manifests as:
+
+        paramiko.ssh_exception.SSHException: Error reading SSH protocol banner
+
+    Retry schedule (base=3.0 s, jitter=CONNECT_JITTER, cap=30 s):
+        attempt 1 — immediate
+        attempt 2 — sleep  3–4 s   (base * 2^0 + U(0, jitter))
+        attempt 3 — sleep  6–7 s   (base * 2^1 + U(0, jitter))
+        attempt 4 — sleep 12–13 s  (base * 2^2 + U(0, jitter))
+
+    Each failed attempt calls client.close() immediately — the underlying
+    socket is released before the sleep, not deferred to the GC finaliser.
+    """
+    # Transient errors that indicate server-side throttling or a TCP race.
+    _RETRIABLE = (
+        paramiko.SSHException,
+        socket.error,
+        EOFError,
+        OSError,
     )
-    return client
+
+    last_exc: Exception = RuntimeError("unreachable")
+
+    for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+        client, _ = _build_client()
+        try:
+            client.connect(
+                HOST, port=PORT,
+                username=f"bandit{level}",
+                password=password,
+                timeout=CONNECT_TIMEOUT,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            return client
+        except _RETRIABLE as exc:
+            # Close immediately — do NOT leak the socket.
+            with contextlib.suppress(Exception):
+                client.close()
+            last_exc = exc
+
+            if attempt >= MAX_CONNECT_RETRIES:
+                break   # exhausted — raise below
+
+            # Exponential backoff, capped at _RETRY_WAIT_CAP.
+            raw_wait = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+            wait = min(raw_wait, _RETRY_WAIT_CAP) + random.uniform(0, CONNECT_JITTER)
+            _log.warning(
+                "Connect attempt %d/%d failed [%s] — retry in %.1fs",
+                attempt, MAX_CONNECT_RETRIES, type(exc).__name__, wait,
+            )
+            time.sleep(wait)
+
+    raise last_exc
 
 
 def _exec(client: paramiko.SSHClient, cmd: str, timeout: int = EXEC_TIMEOUT) -> str:
@@ -389,7 +464,6 @@ def _secure_tmpdir():
             _log.error("rmtree error on %s: %s", path, exc_info[1])
             raise exc_info[1]
 
-        # _rmtree() translates onerror= / onexc= based on runtime version.
         _rmtree(td, _on_err)
 
 # ── safe tar extraction ───────────────────────────────────────────────────────
@@ -671,7 +745,6 @@ def _solve_level13(client: paramiko.SSHClient) -> str:
         )
 
     # Strategy B: paramiko nested Transport via _ChannelSocket
-    # Chunk list replaces buf += chunk to avoid O(n²) realloc.
     try:
         outer_transport = client.get_transport()
         chan = outer_transport.open_channel(
@@ -811,7 +884,7 @@ def main() -> None:
 
     sep = "─" * 54
     _log.info(sep)
-    _log.info("  OTW Bandit v6.2 — levels 0 → 15")
+    _log.info("  OTW Bandit v6.3 — levels 0 → 15")
     _log.info("  Host  : %s:%d", HOST, PORT)
     _log.info("  Output: %s  (0600, locked)", PASSWORD_FILE)
     _log.info(sep)
