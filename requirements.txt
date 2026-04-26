@@ -4,9 +4,11 @@
 # Pinned to the latest stable releases as of 2025-Q2.
 # Minimum supported Python: 3.10 (uses X | Y union type hints)
 
-# SSH transport — Ed25519/ECDSA/RSA key support; paramiko 3.x dropped DSSKey
+# SSH transport — Ed25519/ECDSA/RSA key support
+# paramiko 3.x: dropped DSSKey, added Ed25519 by default
+# paramiko 3.4+: fixes CVE-2023-48795 (Terrapin prefix truncation attack)
 paramiko>=3.4.0,<4.0
 
 # Optional: load configuration from .env files
-# Remove if you prefer to export env vars manually in your shell.
+# Safe to remove if you prefer to export env vars in your shell instead.
 python-dotenv>=1.0.1,<2.0
