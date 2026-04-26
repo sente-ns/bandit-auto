@@ -1,0 +1,12 @@
+# bandit-auto runtime dependencies
+# Install: pip install -r requirements.txt
+#
+# Pinned to the latest stable releases as of 2025-Q2.
+# Minimum supported Python: 3.10 (uses X | Y union type hints)
+
+# SSH transport — Ed25519/ECDSA/RSA key support; paramiko 3.x dropped DSSKey
+paramiko>=3.4.0,<4.0
+
+# Optional: load configuration from .env files
+# Remove if you prefer to export env vars manually in your shell.
+python-dotenv>=1.0.1,<2.0
